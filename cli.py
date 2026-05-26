@@ -59,16 +59,39 @@ def cmd_generate(args) -> None:
     print("Done.")
 
 
+def cmd_scaffolds(_args) -> None:
+    """List all saved scaffold snapshots."""
+    import json
+    from pathlib import Path
+    sd = Path("logs") / "scaffolds"
+    if not sd.exists() or not list(sd.glob("*.json")):
+        print("No saved scaffolds found.")
+        return
+    rows = []
+    for f in sorted(sd.glob("*.json")):
+        d = json.loads(f.read_text())
+        rows.append((d["version_id"], d["generation"],
+                     (d.get("mutation_rationale") or "")[:50],
+                     [t["name"] for t in d["tools"]]))
+    rows.sort(key=lambda r: r[1])
+    print(f"{'ID':<14} {'Gen':>4}  {'Tools':<50}  Rationale")
+    print("-" * 110)
+    for vid, gen, rat, tools in rows:
+        print(f"{vid:<14} {gen:>4}  {str(tools):<50}  {rat}")
+
+
 def cmd_run(args) -> None:
     from evolve import evolve
-    evolve(args.scenario, n_generations=args.generations)
+    evolve(args.scenario, n_generations=args.generations,
+           from_scaffold=args.from_scaffold)
 
 
 def main():
     p = argparse.ArgumentParser(prog="cli")
     sub = p.add_subparsers(dest="cmd")
 
-    sub.add_parser("list", help="List registered scenarios")
+    sub.add_parser("list",      help="List registered scenarios")
+    sub.add_parser("scaffolds", help="List saved scaffold snapshots")
 
     ps = sub.add_parser("show", help="Show scenario details")
     ps.add_argument("scenario")
@@ -79,12 +102,15 @@ def main():
     pr = sub.add_parser("run", help="Run evolution on a scenario")
     pr.add_argument("scenario")
     pr.add_argument("--generations", type=int, default=4)
+    pr.add_argument("--from-scaffold", default=None,
+                    help="Start from a saved scaffold version ID (enables transfer test)")
 
     args = p.parse_args()
-    if args.cmd == "list":       cmd_list(args)
-    elif args.cmd == "show":     cmd_show(args)
-    elif args.cmd == "generate": cmd_generate(args)
-    elif args.cmd == "run":      cmd_run(args)
+    if args.cmd == "list":        cmd_list(args)
+    elif args.cmd == "show":      cmd_show(args)
+    elif args.cmd == "generate":  cmd_generate(args)
+    elif args.cmd == "scaffolds": cmd_scaffolds(args)
+    elif args.cmd == "run":       cmd_run(args)
     else:
         p.print_help()
 

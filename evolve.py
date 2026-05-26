@@ -15,7 +15,7 @@ import anthropic
 import scenarios as sc
 from agent import Trajectory, run_episode, evaluate
 from meta_agent import Mutation, apply, propose
-from scaffold import ScaffoldVersion, make_initial_scaffold, snapshot
+from scaffold import ScaffoldVersion, load, make_initial_scaffold, snapshot
 from scenarios.base import Task
 
 EPSILON        = 0.15   # higher bar since val set is small (1 task = 100% swings)
@@ -64,7 +64,8 @@ def _val_score(scaffold: ScaffoldVersion, scenario, client) -> float:
 # ── main loop ─────────────────────────────────────────────────────────────────
 
 def evolve(scenario_id: str, api_key: Optional[str] = None,
-           n_generations: int = N_GENERATIONS) -> None:
+           n_generations: int = N_GENERATIONS,
+           from_scaffold: Optional[str] = None) -> None:
     sc.load_all()
     scenario = sc.get(scenario_id)
     client   = anthropic.Anthropic(api_key=api_key or os.environ["ANTHROPIC_API_KEY"])
@@ -74,7 +75,12 @@ def evolve(scenario_id: str, api_key: Optional[str] = None,
         print("  [data] generating …")
         scenario.generate_data(scenario.data_dir)
 
-    scaffold = make_initial_scaffold()
+    if from_scaffold:
+        scaffold = load(from_scaffold)
+        print(f"  [scaffold] Loaded starting scaffold {from_scaffold}: "
+              f"tools={[t.name for t in scaffold.tools]}")
+    else:
+        scaffold = make_initial_scaffold()
     scaffold = snapshot(scaffold, 0)
 
     history = []
