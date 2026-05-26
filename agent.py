@@ -1,21 +1,21 @@
 """
-Base agent loop: plan → select tool → execute → observe → repeat.
-Returns a Trajectory for every task episode.
+Haiku agent loop with limited context.
+max_tokens_per_step and max_steps are kept small so the agent is
+forced to use tools rather than reasoning from a large context.
 """
 from __future__ import annotations
 
-import json
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import anthropic
 
+import tools as tool_module
 from scaffold import ScaffoldVersion, ToolSpec
-from tools import BUILTIN_DISPATCH, run_dynamic_tool, memory_clear
 
-AGENT_MODEL = "claude-sonnet-4-6"
-MAX_TOKENS_PER_STEP = 2048
+AGENT_MODEL = "claude-haiku-4-5-20251001"
 
 
 @dataclass
@@ -31,7 +31,7 @@ class Step:
 @dataclass
 class Trajectory:
     task_id: str
-    task_text: str
+    question: str
     correct_answer: str
     steps: List[Step] = field(default_factory=list)
     final_answer: str = ""
@@ -41,139 +41,163 @@ class Trajectory:
     error: Optional[str] = None
 
 
-def _tool_definitions(scaffold: ScaffoldVersion) -> List[Dict[str, Any]]:
-    defs = []
-    for t in scaffold.tools:
-        if t.enabled:
-            defs.append({
-                "name": t.name,
-                "description": t.description,
-                "input_schema": t.parameters,
-            })
-    return defs
+# ── tool execution ────────────────────────────────────────────────────────────
 
-
-def _execute_tool(name: str, inputs: Dict[str, Any], scaffold: ScaffoldVersion) -> str:
-    # Built-in tools
-    if name in BUILTIN_DISPATCH:
+def _execute(spec: ToolSpec, inputs: Dict[str, Any], data_dir: Path) -> str:
+    if spec.source == "builtin":
+        fn = getattr(tool_module, spec.name, None)
+        if fn is None:
+            return f"Error: built-in '{spec.name}' not found"
         try:
-            return str(BUILTIN_DISPATCH[name](**inputs))
+            # built-ins that need data_dir accept it as kwarg
+            import inspect
+            sig = inspect.signature(fn)
+            if "data_dir" in sig.parameters:
+                return str(fn(**inputs, data_dir=data_dir))
+            return str(fn(**inputs))
         except Exception as e:
-            return f"ToolError({name}): {e}"
+            return f"ToolError({spec.name}): {e}"
 
-    # Dynamically-added tools
-    for spec in scaffold.tools:
-        if spec.name == name and spec.implementation != "builtin":
-            return run_dynamic_tool(spec.implementation, name, inputs)
+    if spec.source == "library":
+        entry = tool_module.TOOL_LIBRARY.get(spec.name)
+        if not entry:
+            return f"Error: library tool '{spec.name}' not found"
+        try:
+            return str(entry["fn"](**inputs, data_dir=data_dir))
+        except Exception as e:
+            return f"ToolError({spec.name}): {e}"
 
-    return f"Error: tool '{name}' not found"
+    # dynamic
+    return tool_module.run_dynamic_tool(spec.implementation, spec.name, inputs, data_dir)
 
 
-def _extract_text(content: List[Any]) -> str:
-    parts = []
-    for block in content:
-        if hasattr(block, "type") and block.type == "text":
-            parts.append(block.text)
-    return " ".join(parts).strip()
+# ── schema context injected into system prompt ────────────────────────────────
 
+def _schema_context(data_dir: Path) -> str:
+    import pandas as pd
+    lines = ["\nAvailable data files:"]
+    for f in sorted(data_dir.glob("*.csv")):
+        n = sum(1 for _ in open(f)) - 1
+        df = pd.read_csv(f, nrows=3)
+        col_info = ", ".join(
+            f"{c}({df[c].dtype})" for c in df.columns
+        )
+        lines.append(f"  {f.name}  ({n:,} rows)  [{col_info}]")
+    return "\n".join(lines)
+
+
+# ── evaluator ─────────────────────────────────────────────────────────────────
+
+import re
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", s.lower().strip().rstrip("."))
+
+
+def evaluate(predicted: str, correct: str) -> bool:
+    pn, cn = _norm(predicted), _norm(correct)
+    if cn == pn or cn in pn:
+        return True
+    # strip commas and recheck
+    if cn.replace(",", "") in pn.replace(",", ""):
+        return True
+    # numeric
+    try:
+        c = float(correct.replace(",", ""))
+        for m in re.finditer(r"-?\d[\d,]*\.?\d*", predicted):
+            if abs(float(m.group().replace(",", "")) - c) <= max(1e-4, abs(c) * 1e-4):
+                return True
+    except ValueError:
+        pass
+    return False
+
+
+# ── episode ───────────────────────────────────────────────────────────────────
 
 def run_episode(
     task_id: str,
-    task_text: str,
+    question: str,
     correct_answer: str,
     scaffold: ScaffoldVersion,
+    data_dir: Path,
     client: anthropic.Anthropic,
-    evaluator,
 ) -> Trajectory:
-    """Run one agent episode on a single task."""
-    memory_clear()
-    traj = Trajectory(task_id=task_id, task_text=task_text, correct_answer=correct_answer)
+    traj = Trajectory(task_id=task_id, question=question, correct_answer=correct_answer)
     t0 = time.time()
 
-    messages = [{"role": "user", "content": task_text}]
-    tool_defs = _tool_definitions(scaffold)
-    max_steps = scaffold.planning_policy.max_steps
+    policy  = scaffold.planning_policy
+    schema  = _schema_context(data_dir)
+    system  = policy.system_prompt + schema
+
+    tool_defs = [
+        {"name": t.name, "description": t.description, "input_schema": t.parameters}
+        for t in scaffold.tools
+    ]
+
+    messages = [{"role": "user", "content": question}]
 
     try:
-        for step_num in range(max_steps):
-            step_t0 = time.time()
+        for step_num in range(policy.max_steps):
+            st0 = time.time()
             resp = client.messages.create(
                 model=AGENT_MODEL,
-                max_tokens=MAX_TOKENS_PER_STEP,
-                system=scaffold.planning_policy.system_prompt,
+                max_tokens=policy.max_tokens_per_step,
+                system=system,
                 tools=tool_defs,
                 messages=messages,
-                temperature=scaffold.planning_policy.temperature,
             )
             traj.tokens_used += resp.usage.input_tokens + resp.usage.output_tokens
-            latency = (time.time() - step_t0) * 1000
+            latency = (time.time() - st0) * 1000
 
-            assistant_text = _extract_text(resp.content)
+            text = " ".join(
+                b.text for b in resp.content
+                if hasattr(b, "type") and b.type == "text"
+            ).strip()
 
             if resp.stop_reason == "end_turn":
-                traj.steps.append(Step(
-                    step_num=step_num,
-                    tool_name=None,
-                    tool_input=None,
-                    tool_output=None,
-                    assistant_text=assistant_text,
-                    latency_ms=latency,
-                ))
-                traj.final_answer = assistant_text
+                traj.steps.append(Step(step_num, None, None, None, text, latency))
+                traj.final_answer = text
                 break
 
-            elif resp.stop_reason == "tool_use":
+            if resp.stop_reason == "tool_use":
                 messages.append({"role": "assistant", "content": resp.content})
-                tool_results = []
-                step_tools = []
-
-                for block in resp.content:
-                    if not (hasattr(block, "type") and block.type == "tool_use"):
+                results = []
+                for b in resp.content:
+                    if not (hasattr(b, "type") and b.type == "tool_use"):
                         continue
-                    tool_out = _execute_tool(block.name, block.input, scaffold)
-                    tool_results.append({
+                    spec = next((t for t in scaffold.tools if t.name == b.name), None)
+                    if spec is None:
+                        out = f"Error: unknown tool '{b.name}'"
+                    else:
+                        out = _execute(spec, b.input, data_dir)
+                    # truncate long outputs so context stays small
+                    out_trimmed = out[:400] if len(out) > 400 else out
+                    results.append({
                         "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": str(tool_out),
+                        "tool_use_id": b.id,
+                        "content": out_trimmed,
                     })
-                    step_tools.append((block.name, block.input, tool_out))
-
-                messages.append({"role": "user", "content": tool_results})
-
-                # Record one Step per tool call (first call captures them all)
-                for i, (tname, tinput, tout) in enumerate(step_tools):
-                    traj.steps.append(Step(
-                        step_num=step_num,
-                        tool_name=tname,
-                        tool_input=tinput,
-                        tool_output=str(tout),
-                        assistant_text=assistant_text if i == 0 else "",
-                        latency_ms=latency if i == 0 else 0,
-                    ))
-            else:
-                traj.final_answer = assistant_text
-                break
+                    traj.steps.append(Step(step_num, b.name, b.input, out_trimmed, text, latency))
+                    latency = 0
+                messages.append({"role": "user", "content": results})
         else:
-            # Exhausted steps — do one final no-tool call
-            messages.append({"role": "user", "content": "Please provide your final answer now."})
+            # force final answer
+            messages.append({"role": "user", "content": "Provide your final answer now."})
             resp = client.messages.create(
-                model=AGENT_MODEL,
-                max_tokens=512,
-                system=scaffold.planning_policy.system_prompt,
-                messages=messages,
+                model=AGENT_MODEL, max_tokens=128, system=system, messages=messages
             )
             traj.tokens_used += resp.usage.input_tokens + resp.usage.output_tokens
-            traj.final_answer = _extract_text(resp.content)
+            traj.final_answer = " ".join(
+                b.text for b in resp.content if hasattr(b, "type") and b.type == "text"
+            ).strip()
 
     except anthropic.AuthenticationError as e:
-        raise RuntimeError(
-            "Anthropic API key not set. Export ANTHROPIC_API_KEY before running."
-        ) from e
+        raise RuntimeError("Set ANTHROPIC_API_KEY before running.") from e
     except Exception as e:
         traj.error = str(e)
-        traj.final_answer = ""
         print(f"    [agent error] {type(e).__name__}: {e}")
 
     traj.elapsed_s = time.time() - t0
-    traj.success = evaluator(traj.final_answer, correct_answer)
+    traj.success = evaluate(traj.final_answer, correct_answer)
     return traj

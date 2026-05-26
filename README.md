@@ -1,61 +1,43 @@
 # self-improving-agent
 
-A minimal proof-of-life recursive self-improvement (RSI) scaffold: an agent that evolves its own tools, planning policy, and routing rules across generations by reflecting on its failures. Model weights are never modified — only the scaffold mutates.
+A self-improving data analysis agent that discovers its own tools through failure.
+The agent starts with only two tools (`list_files`, `read_sample`) and evolves a
+richer toolkit across generations by reflecting on what it couldn't compute.
 
 ## Concept
 
-The agent has three mutable components:
+The agent answers analytical questions about CSV files too large to fit in context.
+It can only access data through tool calls. When it lacks the right tool, it fails.
+A meta-agent reads those failures, proposes new tools from a pre-built library
+(or writes custom ones), and gates each mutation behind a validation-set improvement.
 
-| Component | What it is | How it mutates |
-|---|---|---|
-| **Tool registry** | Named Python functions the agent can call | Add, modify, or remove tools |
-| **Planning policy** | System prompt governing task decomposition | Full rewrite |
-| **Router rules** | Conditions that bias tool selection | Append new rules |
+**The discovery story:**
 
-After each generation the meta-agent reads failure trajectories, proposes structured mutations, and each candidate is A/B-tested against a validation set. A mutation is accepted only if it improves val score by `> ε`.
+```
+Gen-0  tools=[list_files, read_sample]         train=0%   val=0%
+       → agent samples data but can't count or sum
+       meta-agent: "add filter_count, column_sum"
+Gen-1  tools=[..., column_sum]                 train=33%  val=100%
+       → can now answer sum questions; count questions still fail
+       meta-agent: "add filter_count"
+Gen-2  tools=[..., filter_count]               train=67%  val=100%
+       → still can't rank by group (needs group_aggregate)
+Gen-3  tools=[..., group_aggregate]            train=100% val=100%
+```
 
 ## Architecture
 
 ```
-agent_scaffold/
-  scaffold.py       # Pydantic models (ToolSpec, PlanningPolicy, RouterRule, ScaffoldVersion)
-                    # SHA-12 content-addressed versioning with parent pointers
-  tools.py          # Built-in tools + subprocess runner for dynamically-generated tools
-  agent.py          # Anthropic tool-use loop → Trajectory (steps, answer, tokens, latency)
-  tasks.py          # 30-task suite (18 train / 6 val / 6 test) + evaluator
-  meta_agent.py     # Reads failures → proposes JSON-structured mutations via claude-opus-4-7
-  evolve.py         # Evolution loop: run → reflect → mutate → A/B gate → snapshot
-  logs/             # Per-generation trajectories, scaffold snapshots, evolution_report.json
+scenarios/
+  base.py             # Scenario + Task dataclasses, auto-discovery registry
+  orders_basic.py     # first scenario (single table, 5 tasks)
+scaffold.py           # versioned tool registry (builtin | library | dynamic)
+tools.py              # pandas-backed implementations + TOOL_LIBRARY manifest
+agent.py              # Haiku agent (512 tok/step, 5 steps max)
+meta_agent.py         # reads failures → proposes typed mutations
+evolve.py             # A/B-gated evolution loop, scenario-agnostic
+cli.py                # scenario CRUD + run commands
 ```
-
-## Evolution loop
-
-```python
-for generation in range(N):
-    trajectories = run_agent_on_train_set(current_scaffold)
-    proposals    = meta_agent.propose_mutations(current_scaffold, failures)
-    for proposal in proposals:
-        candidate = apply(current_scaffold, proposal)
-        if eval_on_val(candidate) > eval_on_val(current_scaffold) + epsilon:
-            current_scaffold = candidate          # accepted
-        # else: rejected, logged
-    snapshot(current_scaffold, generation)
-
-final_score = eval_on_test(current_scaffold)
-```
-
-## Task suite
-
-30 multi-step tasks across four categories, designed for a ~45–55% baseline so there is room to improve:
-
-| Category | Count | Requires |
-|---|---|---|
-| Math | 10 | `calculator`, multi-step decomposition |
-| Code | 8 | `python_exec`, iteration |
-| QA | 7 | `web_search`, fact retrieval |
-| Hard / multi-step | 5 | New tools or chained reasoning |
-
-Split: 60 / 20 / 20 train / val / test. Test set is held out until the final generation.
 
 ## Quickstart
 
@@ -64,66 +46,73 @@ git clone https://github.com/shreydesai/self-improving-agent
 cd self-improving-agent
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-
 export ANTHROPIC_API_KEY=sk-...
 
-# Verify setup (no API key needed)
-python3 test_scaffold.py
+# explore scenarios
+python cli.py list
+python cli.py show orders_basic
 
-# Gen-0 baseline only
-python3 evolve.py baseline
-
-# Full evolution (4 generations)
-python3 evolve.py evolve
+# run evolution
+python cli.py run orders_basic
 ```
 
-## Mutation types
+## Adding a scenario
 
-| Type | What changes | Guard |
-|---|---|---|
-| `add_tool` | New Python function added to registry | Val gate + no duplicate names |
-| `modify_tool` | Existing tool description or implementation | Val gate |
-| `rewrite_planning_policy` | System prompt replaced entirely | Val gate + 800-char soft cap |
-| `add_routing_rule` | New condition → preferred tools mapping | Val gate |
-| `remove_tool` | Tool removed from registry | Val gate + core tools protected |
+Create `scenarios/my_scenario.py`:
 
-## Safeguards
+```python
+from pathlib import Path
+from scenarios.base import Scenario, Task, register
 
-- **Sandboxing** — all tool code (including meta-agent-generated) runs in a `subprocess` with a 10 s timeout. Never `exec()`'d in the main process.
-- **A/B gate** — `ε = 0.05`. No mutation ships without a measurable validation win.
-- **Protected tools** — `calculator`, `web_search`, `python_exec`, `memory_read`, `memory_write` cannot be removed.
-- **Budget caps** — `max_steps = 8` per episode, `max_mutations = 2` per generation, `N_GENERATIONS = 4` (all configurable at the top of `evolve.py`).
-- **Determinism** — task ordering is fixed; meta-agent runs without temperature.
+def generate_data(data_dir: Path) -> None:
+    # write CSV files to data_dir
+    ...
+
+scenario = Scenario(
+    id="my_scenario",
+    name="My scenario",
+    description="...",
+    data_dir=Path(__file__).parent / "data" / "my_scenario",
+    generate_data=generate_data,
+    tasks=[
+        Task("t1", "question?", "answer", "train"),
+        Task("t2", "question?", "answer", "val"),
+        Task("t3", "question?", "answer", "test"),
+    ],
+)
+register(scenario)
+```
+
+That's it — `python cli.py list` picks it up automatically.
+
+## Tool library
+
+The meta-agent unlocks tools by name from a pre-built library:
+
+| Tool | What it does |
+|---|---|
+| `filter_count` | Count rows matching conditions |
+| `column_sum` | Sum a column with optional filters |
+| `column_stats` | min / max / mean / count for a column |
+| `get_distinct` | Unique values of a column |
+| `group_aggregate` | Group-by + aggregate (sum/count/mean/min/max) |
+| `sort_top_k` | Top-k rows sorted by a column |
+| `join_tables` | Join two CSVs, optionally cache result |
+
+Custom tools (dynamic Python) are also supported when no library tool fits.
+
+## Design constraints
+
+- **No `python_exec`** — forces real tool discovery instead of ad-hoc scripting
+- **512 tokens/step, 5 steps max** — agent must call tools, not reason from context
+- **ε = 0.15 val gate** — mutations accepted only on measurable improvement
+- **Content-addressed versioning** — every scaffold saved with parent pointer
 
 ## Models
 
 | Role | Model |
 |---|---|
-| Agent | `claude-sonnet-4-6` |
+| Agent | `claude-haiku-4-5-20251001` |
 | Meta-agent | `claude-opus-4-7` |
 
-## Output
-
-Every run produces `logs/evolution_report.json`:
-
-```json
-{
-  "generations": [
-    {
-      "generation": 0,
-      "train_score": 0.94,
-      "val_score": 1.0,
-      "n_tools": 5,
-      "accepted_mutations": [],
-      ...
-    }
-  ],
-  "final_test_score": 0.83
-}
-```
-
-Each scaffold version is saved to `logs/scaffolds/<sha>.json` with a `parent_id` pointer — the full mutation genealogy is replayable.
-
-## Co-authored with
-
-Claude Sonnet 4.6 — [Claude Code](https://claude.ai/code)
+Co-authored with Claude Sonnet 4.6 — [Claude Code](https://claude.ai/code)
