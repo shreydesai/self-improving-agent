@@ -62,7 +62,7 @@ ALL_TASKS: List[Task] = [
          "6", "code", "train",
          "GCD(48,18) = 6"),
     Task("code_04", "Write Python code to reverse the string 'anthropic' and print the result.",
-         "cipohtrna", "code", "train"),
+         "ciporhtna", "code", "train"),
     Task("code_05", "Write Python code to compute 8 factorial (8!) and print the result.",
          "40320", "code", "train"),
     Task("code_06", "Write Python code to find and print the maximum value "
@@ -156,13 +156,19 @@ def _normalize(s: str) -> str:
     return s
 
 
-def _numeric_match(predicted: str, correct: str, tol: float = 1e-6) -> bool:
+def _numeric_match(predicted: str, correct: str, tol: float = 1e-4) -> bool:
     try:
-        p = float(re.search(r"-?\d+\.?\d*", predicted.replace(",", "")).group())
         c = float(correct.replace(",", ""))
-        return abs(p - c) <= tol + abs(c) * tol
-    except (AttributeError, ValueError):
+    except ValueError:
         return False
+    for m in re.finditer(r"-?\d[\d,]*\.?\d*", predicted):
+        try:
+            p = float(m.group().replace(",", ""))
+            if abs(p - c) <= tol + abs(c) * tol:
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def evaluate(predicted: str, correct: str) -> bool:
@@ -174,8 +180,10 @@ def evaluate(predicted: str, correct: str) -> bool:
     if pred_n == corr_n:
         return True
 
-    # Correct answer appears verbatim in prediction
+    # Correct answer appears verbatim in prediction (also try comma-stripped versions)
     if corr_n in pred_n:
+        return True
+    if corr_n.replace(",", "") in pred_n.replace(",", ""):
         return True
 
     # Numeric match

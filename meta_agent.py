@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Literal, Optional
 import anthropic
 
 from agent import Trajectory
-from scaffold import ScaffoldVersion, ToolSpec, RouterRule, PlanningPolicy
+from scaffold import ScaffoldVersion, ToolSpec, RouterRule, PlanningPolicy, _compute_vid
 
 META_MODEL = "claude-opus-4-7"
 MAX_MUTATIONS_PER_ROUND = 3
@@ -275,4 +275,5 @@ def apply_mutation(scaffold: ScaffoldVersion, proposal: MutationProposal) -> Sca
         if name and name not in protected:
             new.tools = [t for t in new.tools if t.name != name]
 
+    new.version_id = _compute_vid(new)
     return new
