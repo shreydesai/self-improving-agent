@@ -209,7 +209,6 @@ def propose_mutations(
         max_tokens=4096,
         system=system,
         messages=[{"role": "user", "content": user_content}],
-        temperature=0,
     )
 
     raw = resp.content[0].text if resp.content else ""
